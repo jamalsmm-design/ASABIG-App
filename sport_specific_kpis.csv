@@ -1,0 +1,54 @@
+Sport,Age Group(s),Gender,KPI Name,Category,Measurement Method,Benchmark Example (direction),Why It Matters,Test Owner
+Football,7–23 (age-scaled),M/F,20m Sprint Time,Physical,Field Test,Faster times with age; elite 16–18 boys < 3.1s,"Determines acceleration capacity for match situations (sprints to ball, transitions).",Coach
+Football,10–23,M/F,Yo-Yo IR1 Distance,Physical,Field Test,Distance increases with age/training,Core indicator of intermittent endurance needed for modern football.,Coach
+Football,7–23,M/F,Technical Skill Index,Technical,Coach Rating (1–5),Higher with age & training,"First touch, passing, ball control; combined into one score to track progression.",Coach
+Football,13–23,M/F,Decision-Making Score,Tactical,Video/game assessment,"Better choices, fewer forced errors","Evaluates reading of the game, positioning, and option selection.",Coach / Analyst
+Football,13–23,M/F,Match Load GPS Metrics,Physical,Device (GPS),"Total distance, high-speed running, sprint count",Links training data with match behaviour; key for high-level pathway.,Performance Staff
+Basketball,10–23,M/F,Vertical Jump Height,Physical,Device / Field,>40cm at 16–18 for promising talents,"Explosiveness for rebounding, blocking, and finishing.",Coach
+Basketball,10–23,M/F,Agility T-Test Time,Physical,Field Test,Lower times with age,Reflects lateral movement and defensive quickness.,Coach
+Basketball,10–23,M/F,Shooting Accuracy %,Technical,Field (set # of shots),% improves with age/level,Core skill; used to separate role profiles (shooter vs. inside player).,Coach
+Basketball,13–23,M/F,Turnover/Decision Index,Tactical,Match stats + video,Fewer turnovers / better assist ratio,Quality of decisions under pressure with the ball.,Analyst
+Volleyball,10–23,M/F,Spike Reach Height,Physical,Device / Wall measurement,Increases with growth + power; key for attackers,Combines height + jump; key for net play potential.,Coach
+Volleyball,10–23,M/F,Serve Accuracy %,Technical,Field test,Higher % = better potential,Serving is a fundamental scoring skill; discriminates at youth levels.,Coach
+Volleyball,13–23,M/F,Reaction & Floor Defense Score,Tactical/Tech,Coach assessment,Higher scores with experience,Reading opponent attack and defensive positioning.,Coach
+Athletics (Sprints),10–23,M/F,60m / 100m Time,Physical,Track timing,Age-scaled high-performance tables,Key performance KPI for sprint pathway.,Coach
+Athletics (Middle Distance),13–23,M/F,800m / 1500m Time,Physical,Track timing,Age-scaled,Core event time; determines pathway future.,Coach
+Athletics (Jumps),10–23,M/F,Standing & Running Jump Distance/Height,Physical,Field / Device,Increases with age and skill,Indicates potential for long/high/triple jump events.,Coach
+Swimming,7–23,M/F,50m Freestyle Time,Physical,Pool timing,Age-scaled tables,Universal benchmark; used as entry point for many strokes.,Coach
+Swimming,10–23,M/F,Stroke Efficiency Index,Technical,Stroke count vs. time,Better swimmers do fewer strokes for same time,"Shows technical quality, not just raw fitness.",Coach
+Swimming,13–23,M/F,400m / 800m Time,Physical,Pool timing,Longer-distance indicator,Endurance and pacing ability; key for middle/long events.,Coach
+Cycling (Road),13–23,M/F,5-min Power (W/kg),Physical,Power meter,Higher W/kg with age/training,Strong link to climbing and time-trial performance.,Coach / Perf
+Cycling (Road),13–23,M/F,20-min Power (FTP W/kg),Physical,Power meter,Age-scaled endurance capacity,Main KPI for sustained efforts; selection for endurance pathway.,Coach / Perf
+Cycling (Road),13–23,M/F,Handling & Cornering Score,Technical,Coach field rating,Higher = better technical control,"Safety, peloton skills, and racing effectiveness.",Coach
+Tennis,7–23,M/F,Serve Speed & Accuracy,Technical,Radar + target zones,"Faster, more accurate with age/level",Critical for match dominance in modern tennis.,Coach
+Tennis,7–23,M/F,Footwork Agility Time,Physical,Court agility drill,Lower times = better,Movement speed and positioning; supports all strokes.,Coach
+Tennis,13–23,M/F,Unforced Error Rate,Tactical,Match stats,Lower is better,Decision-making and risk management under pressure.,Analyst
+Table Tennis,7–23,M/F,Reaction Time (simple/choice),Cognitive,App/device,Faster RT with age,Extremely relevant in TT due to ball speed and close distance.,Coach / System
+Table Tennis,7–23,M/F,Rally Consistency Score,Technical,Max rallies without error,Longer rallies with age,Basic control and spin management; foundation for tactical game.,Coach
+Badminton,10–23,M/F,Multi-directional Agility,Physical,Court drill timing,Faster times with age,Reflects ability to cover court quickly.,Coach
+Badminton,10–23,M/F,Overhead Stroke Quality Score,Technical,Coach rating,Higher score with improved technique,"Serves, clears, smashes – key offensive tools.",Coach
+Handball,10–23,M/F,Throwing Velocity,Physical,Radar gun / estimate,Higher velocity with age/training,Key for shooting threat from backcourt.,Coach
+Handball,10–23,M/F,20m / 30m Sprint,Physical,Field timing,Faster with age,Transition and fast break ability.,Coach
+Handball,13–23,M/F,Tactical Awareness Score,Tactical,Video assessment,Higher at higher levels,Understanding of systems (offense/defense) and rotations.,Coach / Analyst
+Taekwondo,10–23,M/F,Kicking Speed & Accuracy,Technical,Pad + timing / sensor,"Faster, more accurate with age",Core scoring action; influences match success.,Coach
+Taekwondo,10–23,M/F,Yo-Yo / shuttle endurance,Physical,Field Test,Higher levels with training,Supports repeated high-intensity actions in bouts.,Coach
+Judo,14–23,M/F,Grip Strength,Physical,Hand dynamometer,Higher vs. body weight,Critical for control in throws and grip fighting.,Coach / Medical
+Judo,14–23,M/F,Throw Execution Quality,Technical,Coach rating,Higher technique score,"Shows technical base (kuzushi, tsukuri, kake).",Coach
+Wrestling,14–23,M/F,"Relative Strength (pull-ups, push-ups)",Physical,Field tests,More reps / better quality,Whole-body strength relative to weight; essential in grappling exchanges.,Coach
+Wrestling,14–23,M/F,Takedown Success Rate,Technical/Tactical,Match stats,Higher % indicates technical + tactical superiority,Directly linked to competitive success.,Coach / Analyst
+Weightlifting,14–23,M/F,Technique Score (snatch/clean),Technical,Coach rating + video,High technical score before loading heavy,Ensures safe progression and long-term potential.,Coach
+Weightlifting,16–23,M/F,Relative Strength (1RM/body weight),Physical,Gym testing,Ratios improve with training,Key performance KPI; but must respect age & maturity.,Coach / Medical
+Fencing,10–23,M/F,Lunge Speed & Distance,Physical,Timing + distance,"Faster, longer with age",Core movement for attack; discriminates potential.,Coach
+Fencing,10–23,M/F,Bout Hit Ratio,Tactical,Match stats,Higher ratio = efficient actions,Links decision-making and technical execution.,Coach / Analyst
+Karate,10–23,M/F,Technique Quality Score,Technical,Kata / kumite rating,Higher scores reflect technical proficiency,Foundation for both kata and kumite success.,Coach
+Karate,10–23,M/F,Speed Combination Drill Time,Physical,Timed striking drill,Lower times = faster combinations,Ability to execute fast sequences under control.,Coach
+Equestrian,14–23,M/F,Rider Balance & Position Score,Technical,Coach rating,"Higher scores = safer, more effective riding","Fundamental for control, safety and performance over jumps.",Coach
+Equestrian,14–23,M/F,Course Faults per Round,Tactical,Competition stats,Fewer faults = better decision-making and control,Reflects tactical choices (speed vs. safety) and partnership with horse.,Coach
+Shooting,14–23,M/F,Grouping Size / Score,Technical,Range scoring,Smaller grouping / higher score,Core KPI; measures precision and control.,Coach
+Shooting,14–23,M/F,Stability / Sway Index,Physical,Balance platform / test,Lower sway = more stability,Postural control crucial for consistent shooting performance.,Medical / Coach
+Golf,14–23,M/F,Club Head Speed,Physical,Launch monitor,Higher speed with control,Potential for distance off the tee; key modern KPI.,Coach / Perf
+Golf,14–23,M/F,Driving Accuracy %,Technical,Fairway hit %,Higher % = better control,Balances distance with accuracy; central in performance.,Coach
+Golf,14–23,M/F,Putting Conversion (inside 2m),Technical,Putting drill stats,Higher % = better short-game skill,Decides scoring potential; separates high performers.,Coach
+eSports,13–23,M/F,Reaction Time (ms),Cognitive,App/device,Lower ms = faster reaction,Critical for fast-paced competitive games.,System / Coach
+eSports,13–23,M/F,Actions per Minute (APM),Technical,In-game analytics,Higher APM with control,Skill execution speed and multitasking ability.,System / Analyst
+eSports,13–23,M/F,Decision Quality Index,Tactical,Game replay analysis,Better decision index over matches,Reflects tactical understanding and adaptation.,Analyst
