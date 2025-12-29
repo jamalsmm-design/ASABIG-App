@@ -6,7 +6,7 @@ import hashlib
 import datetime as dt
 import re
 import os
-from typing import Optional, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 
 # ============================================================
 # CONFIG
@@ -28,7 +28,6 @@ DATA_FILES = {
 }
 
 ROLES = ["Player", "Parent", "Scout", "Academy", "Admin"]
-
 AGE_GROUPS = ["U10", "U14", "U17", "U23"]
 GENDERS = ["M", "F"]
 
@@ -39,9 +38,6 @@ APP_TITLE = "ASABIG – Talent Identification Platform (Pilot Demo)"
 # HELPERS (DATA SAFETY + DB)
 # ============================================================
 def safe_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make dataframe safe for Streamlit display (avoid pyarrow mixed-type issues).
-    """
     if df is None:
         return pd.DataFrame()
     if not isinstance(df, pd.DataFrame):
@@ -74,6 +70,14 @@ def now_ts() -> str:
 
 def valid_email(email: str) -> bool:
     return bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email.strip(), re.I))
+
+
+def year_now() -> int:
+    return dt.datetime.now().year
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 def init_db():
@@ -170,6 +174,21 @@ def init_db():
     )
     """)
 
+    # Scout shortlist
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS scout_shortlist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scout_user_id INTEGER NOT NULL,
+        athlete_id TEXT NOT NULL,
+        tag TEXT,
+        priority INTEGER DEFAULT 3, -- 1 high, 5 low
+        created_at TEXT NOT NULL,
+        UNIQUE(scout_user_id, athlete_id),
+        FOREIGN KEY(scout_user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(athlete_id) REFERENCES athlete_profiles(athlete_id) ON DELETE CASCADE
+    )
+    """)
+
     # Create an admin if none exists (demo only)
     cur.execute("SELECT COUNT(*) FROM users WHERE role='Admin'")
     if cur.fetchone()[0] == 0:
@@ -193,15 +212,10 @@ def load_csv(name: str) -> Optional[pd.DataFrame]:
     try:
         return pd.read_csv(path)
     except Exception:
-        # fallback
         return pd.read_csv(path, encoding="utf-8", errors="ignore")
 
 
 def ensure_demo_profiles_from_csv():
-    """
-    Take athletes.csv demo and ensure a copy exists in DB so that:
-    - Uploads / Metrics / Notes can attach to athletes
-    """
     demo = load_csv("athletes")
     if demo is None or demo.empty:
         return
@@ -210,9 +224,8 @@ def ensure_demo_profiles_from_csv():
     conn = db()
     cur = conn.cursor()
 
-    # Normalize expected columns
-    # required: athlete_id, full_name, gender, birth_year, sport, dominant_side, club, city
     cols = {c.lower(): c for c in demo.columns}
+
     def col(*names):
         for n in names:
             if n in cols:
@@ -243,10 +256,9 @@ def ensure_demo_profiles_from_csv():
         except Exception:
             by_int = None
 
-        # Age group heuristic (demo only)
         ag = None
         if by_int:
-            age = dt.datetime.now().year - by_int
+            age = year_now() - by_int
             if age <= 10:
                 ag = "U10"
             elif age <= 14:
@@ -285,7 +297,8 @@ def ensure_demo_profiles_from_csv():
 def get_user_by_email(email: str):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT id, full_name, email, password_hash, role, linked_athlete_id, academy_name FROM users WHERE email=?", (email.strip().lower(),))
+    cur.execute("SELECT id, full_name, email, password_hash, role, linked_athlete_id, academy_name FROM users WHERE email=?",
+                (email.strip().lower(),))
     row = cur.fetchone()
     conn.close()
     return row
@@ -294,13 +307,15 @@ def get_user_by_email(email: str):
 def get_user_by_id(user_id: int):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT id, full_name, email, password_hash, role, linked_athlete_id, academy_name FROM users WHERE id=?", (user_id,))
+    cur.execute("SELECT id, full_name, email, password_hash, role, linked_athlete_id, academy_name FROM users WHERE id=?",
+                (user_id,))
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def create_user(full_name: str, email: str, password: str, role: str, linked_athlete_id: Optional[str], academy_name: Optional[str]):
+def create_user(full_name: str, email: str, password: str, role: str,
+                linked_athlete_id: Optional[str], academy_name: Optional[str]):
     conn = db()
     cur = conn.cursor()
     cur.execute("""
@@ -354,7 +369,8 @@ def get_athlete(athlete_id: str) -> Optional[dict]:
     conn.close()
     if not r:
         return None
-    keys = ["athlete_id","full_name","gender","birth_year","age_group","sport","dominant_side","club","city","photo_path","preferences_json","created_at","updated_at"]
+    keys = ["athlete_id", "full_name", "gender", "birth_year", "age_group", "sport", "dominant_side",
+            "club", "city", "photo_path", "preferences_json", "created_at", "updated_at"]
     return dict(zip(keys, r))
 
 
@@ -420,20 +436,44 @@ def add_metric(athlete_id: str, metric_name: str, metric_value: float, unit: str
     conn.close()
 
 
-def list_metrics(athlete_id: str) -> pd.DataFrame:
+def list_metrics(athlete_id: str, limit: int = 300) -> pd.DataFrame:
     conn = db()
     df = pd.read_sql_query("""
         SELECT measured_at, metric_name, metric_value, unit, source_role, notes
         FROM athlete_metrics
         WHERE athlete_id=?
         ORDER BY measured_at DESC
-        LIMIT 200
-    """, conn, params=(athlete_id,))
+        LIMIT ?
+    """, conn, params=(athlete_id, limit))
     conn.close()
     return safe_df(df)
 
 
-def save_upload(athlete_id: str, upload_type: str, title: str, file_bytes: Optional[bytes], filename: Optional[str],
+def metrics_pivot_latest(athlete_id: str) -> pd.DataFrame:
+    df = list_metrics(athlete_id, limit=500)
+    if df.empty:
+        return df
+    # latest per metric_name
+    df2 = df.sort_values("measured_at", ascending=False)
+    df2 = df2.drop_duplicates(subset=["metric_name"], keep="first")
+    return df2[["metric_name", "metric_value", "unit", "measured_at"]].reset_index(drop=True)
+
+
+def metric_trend(athlete_id: str, metric_name: str) -> pd.DataFrame:
+    conn = db()
+    df = pd.read_sql_query("""
+        SELECT measured_at, metric_value
+        FROM athlete_metrics
+        WHERE athlete_id=? AND metric_name=?
+        ORDER BY measured_at ASC
+        LIMIT 300
+    """, conn, params=(athlete_id, metric_name))
+    conn.close()
+    return safe_df(df)
+
+
+def save_upload(athlete_id: str, upload_type: str, title: str,
+                file_bytes: Optional[bytes], filename: Optional[str],
                 link_url: Optional[str], uploaded_by_user_id: Optional[int]) -> Optional[str]:
     athlete_folder = UPLOADS_DIR / athlete_id / upload_type
     athlete_folder.mkdir(parents=True, exist_ok=True)
@@ -465,15 +505,15 @@ def save_upload(athlete_id: str, upload_type: str, title: str, file_bytes: Optio
     return file_path if file_path else None
 
 
-def list_uploads(athlete_id: str) -> pd.DataFrame:
+def list_uploads(athlete_id: str, limit: int = 200) -> pd.DataFrame:
     conn = db()
     df = pd.read_sql_query("""
         SELECT created_at, upload_type, title, file_path, link_url
         FROM uploads
         WHERE athlete_id=?
         ORDER BY created_at DESC
-        LIMIT 200
-    """, conn, params=(athlete_id,))
+        LIMIT ?
+    """, conn, params=(athlete_id, limit))
     conn.close()
     return safe_df(df)
 
@@ -489,15 +529,15 @@ def add_scout_note(scout_user_id: int, athlete_id: str, note: str, rating: Optio
     conn.close()
 
 
-def list_scout_notes(athlete_id: str) -> pd.DataFrame:
+def list_scout_notes(athlete_id: str, limit: int = 200) -> pd.DataFrame:
     conn = db()
     df = pd.read_sql_query("""
         SELECT created_at, note, rating
         FROM scout_notes
         WHERE athlete_id=?
         ORDER BY created_at DESC
-        LIMIT 200
-    """, conn, params=(athlete_id,))
+        LIMIT ?
+    """, conn, params=(athlete_id, limit))
     conn.close()
     return safe_df(df)
 
@@ -516,7 +556,7 @@ def academy_add_roster(academy_user_id: int, athlete_id: str):
 def academy_roster(academy_user_id: int) -> pd.DataFrame:
     conn = db()
     df = pd.read_sql_query("""
-        SELECT r.created_at, r.status, a.athlete_id, a.full_name, a.sport, a.age_group, a.city
+        SELECT r.created_at, r.status, a.athlete_id, a.full_name, a.sport, a.age_group, a.city, a.gender
         FROM academy_roster r
         JOIN athlete_profiles a ON a.athlete_id = r.athlete_id
         WHERE r.academy_user_id=?
@@ -524,6 +564,104 @@ def academy_roster(academy_user_id: int) -> pd.DataFrame:
     """, conn, params=(academy_user_id,))
     conn.close()
     return safe_df(df)
+
+
+def scout_toggle_shortlist(scout_user_id: int, athlete_id: str, tag: str = "", priority: int = 3):
+    conn = db()
+    cur = conn.cursor()
+    # insert or update
+    cur.execute("""
+    INSERT INTO scout_shortlist(scout_user_id, athlete_id, tag, priority, created_at)
+    VALUES (?,?,?,?,?)
+    ON CONFLICT(scout_user_id, athlete_id) DO UPDATE SET
+        tag=excluded.tag,
+        priority=excluded.priority
+    """, (scout_user_id, athlete_id, tag, int(priority), now_ts()))
+    conn.commit()
+    conn.close()
+
+
+def scout_remove_shortlist(scout_user_id: int, athlete_id: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM scout_shortlist WHERE scout_user_id=? AND athlete_id=?", (scout_user_id, athlete_id))
+    conn.commit()
+    conn.close()
+
+
+def scout_shortlist_df(scout_user_id: int) -> pd.DataFrame:
+    conn = db()
+    df = pd.read_sql_query("""
+        SELECT s.created_at, s.priority, s.tag, a.athlete_id, a.full_name, a.sport, a.age_group, a.city, a.gender
+        FROM scout_shortlist s
+        JOIN athlete_profiles a ON a.athlete_id = s.athlete_id
+        WHERE s.scout_user_id=?
+        ORDER BY s.priority ASC, a.full_name ASC
+    """, conn, params=(scout_user_id,))
+    conn.close()
+    return safe_df(df)
+
+
+def completion_score(athlete_id: str) -> Tuple[int, Dict[str, int]]:
+    """
+    Score out of 100 using:
+    - Profile fields (60)
+    - Metrics entries (25)
+    - Uploads (15)
+    """
+    a = get_athlete(athlete_id) or {}
+    uploads = list_uploads(athlete_id, limit=500)
+    metrics = list_metrics(athlete_id, limit=500)
+
+    # profile fields
+    fields = {
+        "full_name": 10,
+        "gender": 8,
+        "birth_year": 8,
+        "age_group": 8,
+        "sport": 8,
+        "dominant_side": 6,
+        "club": 6,
+        "city": 6,
+        "photo_path": 10,
+    }
+    p = 0
+    for k, w in fields.items():
+        v = a.get(k)
+        if k == "photo_path":
+            if v and Path(str(v)).exists():
+                p += w
+        else:
+            if v is not None and str(v).strip() != "":
+                p += w
+
+    # metrics
+    mcount = len(metrics)
+    m = 0
+    if mcount >= 12:
+        m = 25
+    elif mcount >= 6:
+        m = 18
+    elif mcount >= 3:
+        m = 10
+    elif mcount >= 1:
+        m = 5
+
+    # uploads
+    u = 0
+    if not uploads.empty:
+        types = uploads["upload_type"].astype(str).tolist()
+        if "medical_pdf" in types:
+            u += 6
+        if "photo" in types:
+            u += 5
+        if "video" in types:
+            u += 4
+        u = min(u, 15)
+
+    total = int(clamp(p + m + u, 0, 100))
+    breakdown = {"Profile": int(p), "Metrics": int(m), "Uploads": int(u)}
+    return total, breakdown
 
 
 # ============================================================
@@ -536,7 +674,7 @@ ensure_demo_profiles_from_csv()
 # HEADER + AUTH BAR
 # ============================================================
 st.title(APP_TITLE)
-st.caption("Pilot demo for youth (7–23). All examples can be synthetic. Add real integrations later (Nafath, ABSHER, federations, etc.).")
+st.caption("Pilot demo for youth (7–23). Role-based dashboards + data entry + uploads + scout tools.")
 
 u = current_user()
 
@@ -569,9 +707,7 @@ nav_items_auth = [
     "Uploads (PDF/Photo/Video)",
 ]
 
-nav_items_admin = [
-    "Admin Panel",
-]
+nav_items_admin = ["Admin Panel"]
 
 with st.sidebar:
     st.header("ASABIG – Navigation")
@@ -639,7 +775,9 @@ if page == "Login / Register":
             st.error("Passwords do not match.")
         else:
             try:
-                create_user(full_name, email2, pwd1, role, (linked_athlete_id.strip() or None), (academy_name.strip() if academy_name else None))
+                create_user(full_name, email2, pwd1, role,
+                            (linked_athlete_id.strip() or None),
+                            (academy_name.strip() if academy_name else None))
                 st.success("Account created. Please login now.")
             except Exception as e:
                 st.error(f"Registration failed: {e}")
@@ -651,28 +789,26 @@ if page == "Login / Register":
 elif page == "Home":
     st.markdown("### What does ASABIG cover?")
     st.markdown("""
-- 20+ sports (team, individual, combat, racket, eSports)
-- M/F athletes from 7–23 years
-- Integrated view of:
-  - Generic growth & maturation
-  - Field performance tests
-  - Medical & safety gates
-  - Sport-specific KPIs
+- Multi-sport talent identification (youth 7–23)
+- M/F athlete profiles + test metrics + media uploads
+- Role-based ecosystem: Player / Parent / Scout / Academy / Admin
+- Standardized benchmarks + comparison views
 """)
 
-    st.markdown("### Why it matters (for Saudi Arabia)?")
+    st.markdown("### What’s new in this build?")
     st.markdown("""
-- Aligns with Saudi Vision 2030 – Sports & Quality of Life
-- Reduces random selection and late discovery of talent
-- Creates a national standard for tests, thresholds, and reporting
-- Supports federations, clubs, schools, and private academies
+- Role dashboards (KPIs + charts)
+- Completion score for each athlete profile
+- Scout shortlist + notes + filters
+- Academy roster analytics (age/sport/city distribution)
 """)
 
-    st.markdown("### (الهدف بالعربي)")
+    st.markdown("### (بالعربي)")
     st.markdown("""
-- مشروع يوحّد بيانات المواهب الرياضية ويخدم الجهات في المملكة.
-- يعطي اللاعب/الأسرة/الكشاف/الأكاديمية تجربة موحدة.
-- يمكّن مقارنة عادلة حسب العمر والجنس والرياضة.
+- الآن فيه تسجيل/دخول + أدوار + لوحات تحكم.
+- ملف اللاعب صار له نسبة اكتمال واضحة (Completion Score).
+- الكشاف صار عنده Shortlist وملاحظات وتقييم.
+- الأكاديمية عندها Roster + تحليلات سريعة.
 """)
 
 
@@ -707,11 +843,10 @@ elif page == "Benchmarks & Data":
         st.write("Label")
         st.code(DATA_FILES.get(key, ""))
 
-    # Optional filters if exist
     age_col = None
     gender_col = None
     for c in df.columns:
-        if c.lower() in ["age_group", "agegroup", "age group", "age group(s)"]:
+        if c.lower() in ["age_group", "agegroup", "age group"]:
             age_col = c
         if c.lower() in ["gender", "sex"]:
             gender_col = c
@@ -752,7 +887,7 @@ elif page == "Athletes (Demo List)":
     st.subheader("Athletes (Demo + DB)")
     df = list_athletes_db()
     st.dataframe(df, use_container_width=True, height=520)
-    st.caption("This list is coming from DB (seeded from athletes.csv + any new athlete profiles created inside the app).")
+    st.caption("DB seeded from athletes.csv + any new athlete profiles created inside the app.")
 
 
 # ============================================================
@@ -766,7 +901,6 @@ elif page == "Athlete Profile":
         st.warning("No athletes found yet.")
         st.stop()
 
-    # select athlete
     display_col = "full_name" if "full_name" in athletes.columns else athletes.columns[0]
     name_to_id = dict(zip(athletes[display_col].astype(str), athletes["athlete_id"].astype(str)))
     pick_name = st.selectbox("Select athlete:", athletes[display_col].astype(str).tolist())
@@ -777,9 +911,19 @@ elif page == "Athlete Profile":
         st.error("Athlete not found.")
         st.stop()
 
+    score, br = completion_score(athlete_id)
+
     left, right = st.columns([2, 1])
     with left:
         st.markdown(f"### {a['full_name']}  (`{a['athlete_id']}`)")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Completion Score", f"{score}/100")
+        with c2:
+            st.metric("Profile", br["Profile"])
+        with c3:
+            st.metric("Metrics+Uploads", br["Metrics"] + br["Uploads"])
+
         st.write({
             "Gender": a.get("gender"),
             "Birth Year": a.get("birth_year"),
@@ -790,31 +934,43 @@ elif page == "Athlete Profile":
             "City": a.get("city"),
         })
 
-        st.markdown("#### Recent Metrics")
-        mdf = list_metrics(athlete_id)
-        st.dataframe(mdf, use_container_width=True, height=260)
+        st.markdown("#### Latest Metrics (per metric)")
+        latest = metrics_pivot_latest(athlete_id)
+        st.dataframe(latest, use_container_width=True, height=260)
 
-        st.markdown("#### Uploads (PDF/Photo/Video)")
+        st.markdown("#### Trend Chart")
+        if not latest.empty:
+            metric_pick = st.selectbox("Choose metric to plot", latest["metric_name"].astype(str).tolist())
+            trend = metric_trend(athlete_id, metric_pick)
+            if not trend.empty:
+                trend["measured_at"] = pd.to_datetime(trend["measured_at"], errors="coerce")
+                trend = trend.dropna(subset=["measured_at"])
+                trend = trend.sort_values("measured_at")
+                st.line_chart(trend.set_index("measured_at")["metric_value"])
+            else:
+                st.info("No trend yet for this metric.")
+
+        st.markdown("#### Uploads")
         udf = list_uploads(athlete_id)
         st.dataframe(udf, use_container_width=True, height=260)
 
     with right:
         st.markdown("#### Photo")
-        if a.get("photo_path") and Path(a["photo_path"]).exists():
+        if a.get("photo_path") and Path(str(a["photo_path"])).exists():
             st.image(a["photo_path"], use_container_width=True)
         else:
             st.info("No photo uploaded yet.")
 
         st.markdown("#### Scout Notes")
         sdf = list_scout_notes(athlete_id)
-        st.dataframe(sdf, use_container_width=True, height=280)
+        st.dataframe(sdf, use_container_width=True, height=300)
 
 
 # ============================================================
-# PAGE: ATHLETE COMPARISON (UP TO 6)
+# PAGE: ATHLETE COMPARISON
 # ============================================================
 elif page == "Athlete Comparison":
-    st.subheader("Athlete Comparison – Side by Side (Demo)")
+    st.subheader("Athlete Comparison – Side by Side (Pilot)")
 
     athletes = list_athletes_db()
     if athletes.empty:
@@ -822,10 +978,9 @@ elif page == "Athlete Comparison":
         st.stop()
 
     MAX_COMPARE = 6
-
-    display_col = "full_name" if "full_name" in athletes.columns else athletes.columns[0]
+    display_col = "full_name"
     selected_names = st.multiselect(
-        f"Select up to {MAX_COMPARE} athletes to compare:",
+        f"Select up to {MAX_COMPARE} athletes:",
         athletes[display_col].astype(str).tolist(),
         default=athletes[display_col].astype(str).head(4).tolist() if len(athletes) >= 4 else None
     )
@@ -839,31 +994,42 @@ elif page == "Athlete Comparison":
         st.stop()
 
     comp = athletes[athletes[display_col].astype(str).isin(selected_names)].copy()
-    st.dataframe(comp, use_container_width=True, height=220)
+    comp["completion_score"] = comp["athlete_id"].apply(lambda x: completion_score(str(x))[0])
+    st.dataframe(comp, use_container_width=True, height=250)
 
-    st.markdown("### Simple test comparison (demo)")
-    st.caption("Uses athlete_tests.csv (demo) if available + DB metrics if you add them later.")
+    st.markdown("### Compare one metric trend (DB metrics)")
+    ids = comp["athlete_id"].astype(str).tolist()
+    # collect metric names across selected athletes
+    metric_names = []
+    for aid in ids:
+        latest = metrics_pivot_latest(aid)
+        metric_names += latest["metric_name"].astype(str).tolist() if not latest.empty else []
+    metric_names = sorted(list(set(metric_names)))
 
-    # Load demo athlete_tests.csv (optional)
-    tests = load_csv("athlete_tests")
-    if tests is not None and not tests.empty:
-        tests = safe_df(tests)
-        # expects athlete_id + metric columns
-        if "athlete_id" in tests.columns:
-            metric_cols = [c for c in tests.columns if c != "athlete_id"]
-            metric = st.selectbox("Metric from athlete_tests.csv", metric_cols, index=0)
-            comp_ids = comp["athlete_id"].astype(str).tolist()
-            tview = tests[tests["athlete_id"].astype(str).isin(comp_ids)][["athlete_id", metric]].copy()
-            tview = tview.merge(comp[["athlete_id", "full_name"]], on="athlete_id", how="left")
-            st.bar_chart(tview.set_index("full_name")[metric])
-        else:
-            st.info("athlete_tests.csv موجود لكن ما فيه عمود athlete_id.")
+    if not metric_names:
+        st.info("No DB metrics yet for these athletes (add some in Profile & Data Entry).")
     else:
-        st.info("athlete_tests.csv not found or empty — DB metrics can still be compared via Dashboard (Player/Scout).")
+        metric_pick = st.selectbox("Metric to compare (trend)", metric_names)
+        chart_df = pd.DataFrame()
+        for aid in ids:
+            a = get_athlete(aid) or {}
+            name = a.get("full_name", aid)
+            t = metric_trend(aid, metric_pick)
+            if t.empty:
+                continue
+            t["measured_at"] = pd.to_datetime(t["measured_at"], errors="coerce")
+            t = t.dropna(subset=["measured_at"])
+            t = t.sort_values("measured_at")
+            t = t.set_index("measured_at")[["metric_value"]].rename(columns={"metric_value": name})
+            chart_df = t if chart_df.empty else chart_df.join(t, how="outer")
+        if chart_df.empty:
+            st.info("No trend data available for this metric.")
+        else:
+            st.line_chart(chart_df)
 
 
 # ============================================================
-# PAGE: DASHBOARD (ROLE-BASED)
+# PAGE: DASHBOARD (ADVANCED)
 # ============================================================
 elif page == "Dashboard":
     if not u:
@@ -871,54 +1037,138 @@ elif page == "Dashboard":
         st.stop()
 
     user_id, full_name, email, _, role, linked_athlete_id, academy_name = u
-
     st.subheader(f"{role} Dashboard")
 
+    # ---------------------------
+    # PLAYER / PARENT DASHBOARD
+    # ---------------------------
     if role in ["Player", "Parent"]:
-        st.markdown("#### Your linked athlete")
+        st.markdown("### My Athlete Snapshot")
         if not linked_athlete_id:
-            st.info("No athlete linked yet. Go to **Profile & Data Entry** to create/link one.")
+            st.info("No linked athlete yet. Go to **Profile & Data Entry** to create/link one.")
+            st.stop()
+
+        a = get_athlete(linked_athlete_id)
+        if not a:
+            st.warning("Linked athlete not found. Go to Profile & Data Entry to create it.")
+            st.stop()
+
+        score, br = completion_score(linked_athlete_id)
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Completion Score", f"{score}/100")
+        with c2:
+            st.metric("Profile", br["Profile"])
+        with c3:
+            st.metric("Metrics", br["Metrics"])
+        with c4:
+            st.metric("Uploads", br["Uploads"])
+
+        st.progress(score / 100)
+
+        st.markdown("#### Recommended next actions (Pilot)")
+        actions = []
+        if br["Profile"] < 55:
+            actions.append("Complete athlete profile fields (sport, age group, club, city, dominant side).")
+        if br["Uploads"] < 10:
+            actions.append("Upload profile photo + at least one medical PDF or a video link.")
+        if br["Metrics"] < 18:
+            actions.append("Add at least 6 test metrics (speed, endurance, agility, strength, body composition).")
+        if not actions:
+            actions.append("Great — your athlete profile is solid for pilot stage.")
+        for i, atext in enumerate(actions, 1):
+            st.write(f"{i}. {atext}")
+
+        st.divider()
+
+        st.markdown("### Latest Metrics")
+        latest = metrics_pivot_latest(linked_athlete_id)
+        st.dataframe(latest, use_container_width=True, height=260)
+
+        st.markdown("### Charts")
+        if latest.empty:
+            st.info("No metrics yet. Add metrics in **Profile & Data Entry**.")
         else:
-            a = get_athlete(linked_athlete_id)
-            if not a:
-                st.warning("Linked athlete ID not found. Go to Profile & Data Entry to create it.")
-            else:
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric("Athlete", a["full_name"])
-                with c2:
-                    st.metric("Sport", a.get("sport") or "-")
-                with c3:
-                    st.metric("Age Group", a.get("age_group") or "-")
-                with c4:
-                    mcount = len(list_metrics(linked_athlete_id))
-                    st.metric("Metrics entries", mcount)
+            metric_pick = st.selectbox("Choose metric", latest["metric_name"].astype(str).tolist())
+            t = metric_trend(linked_athlete_id, metric_pick)
+            if not t.empty:
+                t["measured_at"] = pd.to_datetime(t["measured_at"], errors="coerce")
+                t = t.dropna(subset=["measured_at"]).sort_values("measured_at")
+                st.line_chart(t.set_index("measured_at")["metric_value"])
 
-                st.markdown("#### Recent activity")
-                st.dataframe(list_metrics(linked_athlete_id).head(15), use_container_width=True)
-                st.dataframe(list_uploads(linked_athlete_id).head(15), use_container_width=True)
+        st.divider()
+        st.markdown("### Uploads")
+        udf = list_uploads(linked_athlete_id)
+        st.dataframe(udf, use_container_width=True, height=260)
 
+    # ---------------------------
+    # SCOUT DASHBOARD
+    # ---------------------------
     elif role == "Scout":
-        st.markdown("#### Scout tools")
-        athletes = list_athletes_db()
-        q = st.text_input("Search athlete (name / city / sport)")
-        view = athletes.copy()
-        if q.strip():
-            ql = q.strip().lower()
-            mask = (
-                view["full_name"].str.lower().str.contains(ql, na=False) |
-                view["city"].str.lower().str.contains(ql, na=False) |
-                view["sport"].str.lower().str.contains(ql, na=False)
-            )
-            view = view[mask]
+        st.markdown("### Scout Search + Shortlist")
 
+        athletes = list_athletes_db()
+
+        filters = st.columns(4)
+        with filters[0]:
+            sport_f = st.selectbox("Sport", ["All"] + sorted(athletes["sport"].dropna().unique().tolist()))
+        with filters[1]:
+            age_f = st.selectbox("Age Group", ["All"] + sorted(athletes["age_group"].dropna().unique().tolist()))
+        with filters[2]:
+            city_f = st.selectbox("City", ["All"] + sorted(athletes["city"].dropna().unique().tolist()))
+        with filters[3]:
+            min_score = st.slider("Min Completion Score", 0, 100, 40)
+
+        q = st.text_input("Search by name")
+        view = athletes.copy()
+
+        if sport_f != "All":
+            view = view[view["sport"].astype(str) == str(sport_f)]
+        if age_f != "All":
+            view = view[view["age_group"].astype(str) == str(age_f)]
+        if city_f != "All":
+            view = view[view["city"].astype(str) == str(city_f)]
+        if q.strip():
+            view = view[view["full_name"].str.lower().str.contains(q.strip().lower(), na=False)]
+
+        view["completion_score"] = view["athlete_id"].apply(lambda x: completion_score(str(x))[0])
+        view = view[view["completion_score"] >= min_score].sort_values(["completion_score", "full_name"], ascending=[False, True])
+
+        st.markdown("#### Candidate list")
         st.dataframe(view, use_container_width=True, height=320)
 
-        st.markdown("#### Add scout note / rating")
+        st.divider()
+
+        st.markdown("### Shortlist")
+        sl = scout_shortlist_df(user_id)
+        st.dataframe(sl, use_container_width=True, height=240)
+
+        st.markdown("#### Add/Update shortlist entry")
         if not view.empty:
-            pick = st.selectbox("Choose athlete:", view["full_name"].astype(str).tolist())
+            pick = st.selectbox("Choose athlete to shortlist", view["full_name"].astype(str).tolist())
             athlete_id = view[view["full_name"].astype(str) == pick]["athlete_id"].astype(str).iloc[0]
 
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
+                tag = st.text_input("Tag", placeholder="e.g., Fast, High potential, Needs review")
+            with c2:
+                priority = st.selectbox("Priority", [1, 2, 3, 4, 5], index=2)
+            with c3:
+                st.write(" ")
+                st.write(" ")
+                if st.button("Save to shortlist"):
+                    scout_toggle_shortlist(user_id, athlete_id, tag=tag.strip(), priority=int(priority))
+                    st.success("Saved.")
+                    st.rerun()
+
+            if st.button("Remove from shortlist"):
+                scout_remove_shortlist(user_id, athlete_id)
+                st.success("Removed.")
+                st.rerun()
+
+            st.divider()
+            st.markdown("### Scout Notes (selected athlete)")
             with st.form("scout_note_form"):
                 rating = st.slider("Rating (1-10)", 1, 10, 7)
                 note = st.text_area("Note (strengths, weaknesses, potential, recommendation)")
@@ -927,13 +1177,22 @@ elif page == "Dashboard":
                 if note.strip():
                     add_scout_note(user_id, athlete_id, note.strip(), int(rating))
                     st.success("Saved.")
+                    st.rerun()
                 else:
                     st.error("Note is required.")
+
             st.dataframe(list_scout_notes(athlete_id), use_container_width=True, height=220)
 
+            st.markdown("### Quick metrics snapshot")
+            st.dataframe(metrics_pivot_latest(athlete_id), use_container_width=True, height=220)
+
+    # ---------------------------
+    # ACADEMY DASHBOARD
+    # ---------------------------
     elif role == "Academy":
-        st.markdown(f"#### Academy: {academy_name or '(not set)'}")
-        st.caption("Roster management (pilot).")
+        st.markdown(f"### Academy: {academy_name or '(not set)'}")
+        st.caption("Roster management + analytics (pilot).")
+
         athletes = list_athletes_db()
         pick = st.selectbox("Add athlete to roster:", athletes["full_name"].astype(str).tolist())
         athlete_id = athletes[athletes["full_name"].astype(str) == pick]["athlete_id"].astype(str).iloc[0]
@@ -941,23 +1200,78 @@ elif page == "Dashboard":
         if st.button("Add to roster"):
             academy_add_roster(user_id, athlete_id)
             st.success("Added (or already exists).")
+            st.rerun()
 
-        st.markdown("#### Your roster")
-        st.dataframe(academy_roster(user_id), use_container_width=True, height=420)
+        st.divider()
+        roster = academy_roster(user_id)
+        st.markdown("### Roster")
+        st.dataframe(roster, use_container_width=True, height=320)
 
+        st.divider()
+        st.markdown("### Academy Analytics")
+        if roster.empty:
+            st.info("Roster is empty.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("Athletes", len(roster))
+            with c2:
+                st.metric("Sports", roster["sport"].nunique())
+            with c3:
+                st.metric("Cities", roster["city"].nunique())
+            with c4:
+                st.metric("Age Groups", roster["age_group"].nunique())
+
+            # charts
+            st.markdown("#### Distribution by Sport")
+            sport_counts = roster["sport"].value_counts()
+            st.bar_chart(sport_counts)
+
+            st.markdown("#### Distribution by Age Group")
+            age_counts = roster["age_group"].value_counts()
+            st.bar_chart(age_counts)
+
+            st.markdown("#### Distribution by City")
+            city_counts = roster["city"].value_counts().head(15)
+            st.bar_chart(city_counts)
+
+            st.markdown("#### Data quality (Completion Scores)")
+            roster_scores = roster.copy()
+            roster_scores["completion_score"] = roster_scores["athlete_id"].astype(str).apply(lambda x: completion_score(str(x))[0])
+            st.dataframe(roster_scores.sort_values("completion_score", ascending=False), use_container_width=True, height=260)
+
+    # ---------------------------
+    # ADMIN DASHBOARD
+    # ---------------------------
     elif role == "Admin":
-        st.markdown("#### Admin overview")
+        st.markdown("### Admin Overview")
         conn = db()
-        users_df = pd.read_sql_query("SELECT id, full_name, email, role, linked_athlete_id, academy_name, created_at FROM users ORDER BY created_at DESC", conn)
+        users_df = pd.read_sql_query(
+            "SELECT id, full_name, email, role, linked_athlete_id, academy_name, created_at FROM users ORDER BY created_at DESC",
+            conn
+        )
         conn.close()
-        st.dataframe(safe_df(users_df), use_container_width=True, height=350)
 
-        st.markdown("#### DB Athletes")
-        st.dataframe(list_athletes_db(), use_container_width=True, height=350)
+        athletes = list_athletes_db()
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Users", len(users_df))
+        with c2:
+            st.metric("Athletes", len(athletes))
+        with c3:
+            st.metric("Data files present", sum([(BASE_DIR / f).exists() for f in DATA_FILES.values()]))
+
+        st.markdown("#### Users")
+        st.dataframe(safe_df(users_df), use_container_width=True, height=260)
+
+        st.markdown("#### Athletes (with completion)")
+        adf = athletes.copy()
+        adf["completion_score"] = adf["athlete_id"].astype(str).apply(lambda x: completion_score(str(x))[0])
+        st.dataframe(adf.sort_values("completion_score", ascending=False), use_container_width=True, height=320)
 
 
 # ============================================================
-# PAGE: PROFILE & DATA ENTRY
+# PAGE: PROFILE & DATA ENTRY (PERMISSIONS REFINED)
 # ============================================================
 elif page == "Profile & Data Entry":
     if not u:
@@ -967,13 +1281,16 @@ elif page == "Profile & Data Entry":
     user_id, full_name, email, _, role, linked_athlete_id, academy_name = u
 
     st.subheader("Profile & Data Entry")
-    st.caption("Pilot feature: create/update athlete profile + enter test metrics (player/parent), view (scout/academy).")
+    st.caption("Create/update athlete profile + enter test metrics. Permissions depend on role.")
 
-    # Role permissions
+    # Permissions
+    # - Player/Parent: can edit ONLY linked athlete (or create then link)
+    # - Scout: cannot edit profile fields, but can add metrics + notes
+    # - Academy: can edit profile + add metrics for roster athletes
+    # - Admin: all
     can_edit_profile = role in ["Player", "Parent", "Admin", "Academy"]
     can_add_metrics = role in ["Player", "Parent", "Scout", "Academy", "Admin"]
 
-    # Choose athlete
     athletes = list_athletes_db()
     selected_athlete_id = None
 
@@ -982,15 +1299,13 @@ elif page == "Profile & Data Entry":
             selected_athlete_id = linked_athlete_id
             st.info(f"Using linked athlete: {linked_athlete_id}")
         else:
-            st.warning("No linked athlete yet — create one below (Athlete ID) ثم تقدر تربطه بحسابك.")
+            st.warning("No linked athlete yet — create one below and it will auto-link to your account.")
     else:
-        # Scout/Academy/Admin can select any athlete
         pick = st.selectbox("Select athlete:", athletes["full_name"].astype(str).tolist())
         selected_athlete_id = athletes[athletes["full_name"].astype(str) == pick]["athlete_id"].astype(str).iloc[0]
 
     st.divider()
 
-    # Create/update athlete profile
     st.markdown("### Athlete Profile")
     if not selected_athlete_id:
         selected_athlete_id = st.text_input("Athlete ID (create new)", placeholder="e.g., A1001").strip()
@@ -998,52 +1313,59 @@ elif page == "Profile & Data Entry":
     if selected_athlete_id:
         current = get_athlete(selected_athlete_id)
 
-        if current:
-            st.success(f"Loaded athlete: {current['full_name']} ({current['athlete_id']})")
+        score, br = completion_score(selected_athlete_id) if current else (0, {"Profile": 0, "Metrics": 0, "Uploads": 0})
+        st.metric("Completion Score", f"{score}/100")
+        st.progress(score / 100 if score else 0)
+
+        # SCOUT cannot edit profile
+        if role == "Scout":
+            st.warning("Scout role: view-only for profile fields. Use metrics + notes in Dashboard.")
         else:
-            st.info("This athlete ID is new. Fill details and Save to create profile.")
+            if not can_edit_profile:
+                st.warning("Your role can view only here.")
+            else:
+                with st.form("ath_profile_form"):
+                    full_name_f = st.text_input("Full name", value=(current.get("full_name") if current else ""))
+                    gender_f = st.selectbox("Gender", [""] + GENDERS,
+                                            index=(1 if current and current.get("gender") == "M"
+                                                   else 2 if current and current.get("gender") == "F" else 0))
+                    birth_year_f = st.number_input("Birth year", min_value=1980, max_value=year_now(),
+                                                   value=(int(current.get("birth_year") or 2010) if current else 2010))
+                    age_group_f = st.selectbox("Age group", [""] + AGE_GROUPS,
+                                               index=(AGE_GROUPS.index(current.get("age_group")) + 1
+                                                      if current and current.get("age_group") in AGE_GROUPS else 0))
+                    sport_f = st.text_input("Sport", value=(current.get("sport") if current else ""))
+                    dominant_f = st.text_input("Dominant side", value=(current.get("dominant_side") if current else ""))
+                    club_f = st.text_input("Club", value=(current.get("club") if current else ""))
+                    city_f = st.text_input("City", value=(current.get("city") if current else ""))
+                    prefs = st.text_area("Preferences (JSON or text)", value=(current.get("preferences_json") if current else ""), height=90)
+                    save = st.form_submit_button("Save profile")
 
-        if not can_edit_profile:
-            st.warning("Your role can view only. (No edit permissions here).")
-        else:
-            with st.form("ath_profile_form"):
-                full_name_f = st.text_input("Full name", value=(current.get("full_name") if current else ""))
-                gender_f = st.selectbox("Gender", [""] + GENDERS, index=(1 if current and current.get("gender") == "M" else 2 if current and current.get("gender") == "F" else 0))
-                birth_year_f = st.number_input("Birth year", min_value=1980, max_value=dt.datetime.now().year, value=(int(current.get("birth_year") or 2010) if current else 2010))
-                age_group_f = st.selectbox("Age group", [""] + AGE_GROUPS, index=(AGE_GROUPS.index(current.get("age_group")) + 1 if current and current.get("age_group") in AGE_GROUPS else 0))
-                sport_f = st.text_input("Sport", value=(current.get("sport") if current else ""))
-                dominant_f = st.text_input("Dominant side", value=(current.get("dominant_side") if current else ""))
-                club_f = st.text_input("Club", value=(current.get("club") if current else ""))
-                city_f = st.text_input("City", value=(current.get("city") if current else ""))
+                if save:
+                    data = {
+                        "full_name": full_name_f.strip(),
+                        "gender": gender_f.strip() or None,
+                        "birth_year": int(birth_year_f) if birth_year_f else None,
+                        "age_group": age_group_f.strip() or None,
+                        "sport": sport_f.strip() or None,
+                        "dominant_side": dominant_f.strip() or None,
+                        "club": club_f.strip() or None,
+                        "city": city_f.strip() or None,
+                        "photo_path": current.get("photo_path") if current else None,
+                        "preferences_json": prefs.strip() or None,
+                    }
+                    upsert_athlete_profile(selected_athlete_id, data, created_by_user_id=user_id)
+                    st.success("Saved athlete profile.")
 
-                prefs = st.text_area("Preferences (JSON or text)", value=(current.get("preferences_json") if current else ""), height=90)
-                save = st.form_submit_button("Save profile")
-
-            if save:
-                data = {
-                    "full_name": full_name_f.strip(),
-                    "gender": gender_f.strip() or None,
-                    "birth_year": int(birth_year_f) if birth_year_f else None,
-                    "age_group": age_group_f.strip() or None,
-                    "sport": sport_f.strip() or None,
-                    "dominant_side": dominant_f.strip() or None,
-                    "club": club_f.strip() or None,
-                    "city": city_f.strip() or None,
-                    "photo_path": current.get("photo_path") if current else None,
-                    "preferences_json": prefs.strip() or None,
-                }
-                upsert_athlete_profile(selected_athlete_id, data, created_by_user_id=user_id)
-                st.success("Saved athlete profile.")
-
-                # Auto-link for Player/Parent if missing
-                if role in ["Player", "Parent"] and not linked_athlete_id:
-                    conn = db()
-                    cur = conn.cursor()
-                    cur.execute("UPDATE users SET linked_athlete_id=? WHERE id=?", (selected_athlete_id, user_id))
-                    conn.commit()
-                    conn.close()
-                    st.success("Linked athlete to your account.")
-                st.rerun()
+                    # Auto-link for Player/Parent if missing
+                    if role in ["Player", "Parent"] and not linked_athlete_id:
+                        conn = db()
+                        cur = conn.cursor()
+                        cur.execute("UPDATE users SET linked_athlete_id=? WHERE id=?", (selected_athlete_id, user_id))
+                        conn.commit()
+                        conn.close()
+                        st.success("Linked athlete to your account.")
+                    st.rerun()
 
         st.divider()
         st.markdown("### Add test metric")
@@ -1077,7 +1399,7 @@ elif page == "Profile & Data Entry":
 
 
 # ============================================================
-# PAGE: UPLOADS (PDF / PHOTO / VIDEO)
+# PAGE: UPLOADS (PERMISSIONS)
 # ============================================================
 elif page == "Uploads (PDF/Photo/Video)":
     if not u:
@@ -1086,9 +1408,12 @@ elif page == "Uploads (PDF/Photo/Video)":
 
     user_id, full_name, email, _, role, linked_athlete_id, academy_name = u
     st.subheader("Uploads – Medical PDF / Photo / Video")
-    st.caption("Pilot: files are saved in /uploads on the app server. In production: S3/Cloud storage + permissions + audit logs.")
+    st.caption("Pilot: files saved in /uploads. Production: cloud storage + permissions + audit logs.")
 
-    # Choose athlete
+    # Permissions: Scout can upload ONLY video link (pilot rule) — you can change this later
+    can_upload_file = role in ["Player", "Parent", "Academy", "Admin"]
+    can_upload_video_link = role in ["Player", "Parent", "Scout", "Academy", "Admin"]
+
     athletes = list_athletes_db()
     selected_athlete_id = None
 
@@ -1106,71 +1431,81 @@ elif page == "Uploads (PDF/Photo/Video)":
     tab1, tab2, tab3 = st.tabs(["Medical PDF", "Photo", "Video"])
 
     with tab1:
-        st.markdown("#### Upload medical test PDF")
-        pdf = st.file_uploader("Choose PDF", type=["pdf"])
-        title = st.text_input("Title", placeholder="e.g., Blood test, MRI, Fitness clearance")
-        if st.button("Save PDF"):
-            if not pdf:
-                st.error("Please choose a PDF.")
-            else:
-                save_upload(
-                    athlete_id=selected_athlete_id,
-                    upload_type="medical_pdf",
-                    title=(title.strip() or "Medical PDF"),
-                    file_bytes=pdf.getvalue(),
-                    filename=pdf.name,
-                    link_url=None,
-                    uploaded_by_user_id=user_id
-                )
-                st.success("Saved medical PDF.")
-                st.rerun()
+        st.markdown("#### Medical PDF")
+        if not can_upload_file:
+            st.warning("Your role cannot upload files (pilot rule).")
+        else:
+            pdf = st.file_uploader("Choose PDF", type=["pdf"])
+            title = st.text_input("Title", placeholder="e.g., Blood test, MRI, Fitness clearance", key="pdf_title")
+            if st.button("Save PDF"):
+                if not pdf:
+                    st.error("Please choose a PDF.")
+                else:
+                    save_upload(
+                        athlete_id=selected_athlete_id,
+                        upload_type="medical_pdf",
+                        title=(title.strip() or "Medical PDF"),
+                        file_bytes=pdf.getvalue(),
+                        filename=pdf.name,
+                        link_url=None,
+                        uploaded_by_user_id=user_id
+                    )
+                    st.success("Saved medical PDF.")
+                    st.rerun()
 
     with tab2:
-        st.markdown("#### Upload athlete photo")
-        img = st.file_uploader("Choose image", type=["png", "jpg", "jpeg"])
-        if st.button("Save Photo"):
-            if not img:
-                st.error("Please choose an image.")
-            else:
-                file_path = save_upload(
-                    athlete_id=selected_athlete_id,
-                    upload_type="photo",
-                    title="Profile Photo",
-                    file_bytes=img.getvalue(),
-                    filename=img.name,
-                    link_url=None,
-                    uploaded_by_user_id=user_id
-                )
-                # set photo_path on athlete profile
-                a = get_athlete(selected_athlete_id) or {}
-                a["photo_path"] = file_path
-                upsert_athlete_profile(selected_athlete_id, a, created_by_user_id=None)
-                st.success("Saved photo and updated athlete profile.")
-                st.rerun()
+        st.markdown("#### Photo")
+        if not can_upload_file:
+            st.warning("Your role cannot upload files (pilot rule).")
+        else:
+            img = st.file_uploader("Choose image", type=["png", "jpg", "jpeg"])
+            if st.button("Save Photo"):
+                if not img:
+                    st.error("Please choose an image.")
+                else:
+                    file_path = save_upload(
+                        athlete_id=selected_athlete_id,
+                        upload_type="photo",
+                        title="Profile Photo",
+                        file_bytes=img.getvalue(),
+                        filename=img.name,
+                        link_url=None,
+                        uploaded_by_user_id=user_id
+                    )
+                    a = get_athlete(selected_athlete_id) or {}
+                    a["photo_path"] = file_path
+                    upsert_athlete_profile(selected_athlete_id, a, created_by_user_id=None)
+                    st.success("Saved photo and updated athlete profile.")
+                    st.rerun()
 
     with tab3:
-        st.markdown("#### Add video (link) or upload MP4")
-        st.caption("Best practice: use link (YouTube/Vimeo) for pilot. MP4 upload may be limited on Streamlit hosting.")
-        vlink = st.text_input("Video link URL", placeholder="https://youtube.com/...")
+        st.markdown("#### Video (link or file)")
+        st.caption("Pilot: Scout allowed to add link only. Others can upload file too.")
+        vlink = st.text_input("Video link URL", placeholder="https://youtube.com/...", key="vid_link")
         vfile = st.file_uploader("Or upload video file", type=["mp4", "mov", "m4v"])
-        vtitle = st.text_input("Video title", placeholder="e.g., Highlights, Training session")
+        vtitle = st.text_input("Video title", placeholder="e.g., Highlights, Training session", key="vid_title")
         if st.button("Save Video"):
             if not vlink and not vfile:
                 st.error("Provide a link or upload a video file.")
             else:
-                file_bytes = vfile.getvalue() if vfile else None
-                filename = vfile.name if vfile else None
-                save_upload(
-                    athlete_id=selected_athlete_id,
-                    upload_type="video",
-                    title=(vtitle.strip() or "Video"),
-                    file_bytes=file_bytes,
-                    filename=filename,
-                    link_url=(vlink.strip() or None),
-                    uploaded_by_user_id=user_id
-                )
-                st.success("Saved video.")
-                st.rerun()
+                if vfile and not can_upload_file:
+                    st.error("Your role can’t upload files (pilot rule). Use link only.")
+                elif vlink and not can_upload_video_link:
+                    st.error("Your role can’t add video links.")
+                else:
+                    file_bytes = vfile.getvalue() if vfile else None
+                    filename = vfile.name if vfile else None
+                    save_upload(
+                        athlete_id=selected_athlete_id,
+                        upload_type="video",
+                        title=(vtitle.strip() or "Video"),
+                        file_bytes=file_bytes,
+                        filename=filename,
+                        link_url=(vlink.strip() or None),
+                        uploaded_by_user_id=user_id
+                    )
+                    st.success("Saved video.")
+                    st.rerun()
 
     st.divider()
     st.markdown("### All uploads for athlete")
@@ -1187,7 +1522,7 @@ elif page == "Admin Panel":
         st.stop()
 
     st.subheader("Admin Panel (Pilot)")
-    st.caption("User management + exports (pilot only).")
+    st.caption("User management + exports (pilot).")
 
     conn = db()
     users_df = pd.read_sql_query("SELECT id, full_name, email, role, linked_athlete_id, academy_name, created_at FROM users ORDER BY created_at DESC", conn)
@@ -1203,10 +1538,12 @@ elif page == "Admin Panel":
     conn = db()
     metrics_df = pd.read_sql_query("SELECT athlete_id, metric_name, metric_value, unit, measured_at, source_role, notes FROM athlete_metrics ORDER BY measured_at DESC", conn)
     uploads_df = pd.read_sql_query("SELECT athlete_id, upload_type, title, file_path, link_url, created_at FROM uploads ORDER BY created_at DESC", conn)
+    shortlist_df = pd.read_sql_query("SELECT scout_user_id, athlete_id, tag, priority, created_at FROM scout_shortlist ORDER BY created_at DESC", conn)
     conn.close()
 
     st.download_button("Download metrics.csv (export)", data=safe_df(metrics_df).to_csv(index=False).encode("utf-8"), file_name="asabig_metrics_export.csv")
     st.download_button("Download uploads.csv (export)", data=safe_df(uploads_df).to_csv(index=False).encode("utf-8"), file_name="asabig_uploads_export.csv")
+    st.download_button("Download scout_shortlist.csv (export)", data=safe_df(shortlist_df).to_csv(index=False).encode("utf-8"), file_name="asabig_scout_shortlist_export.csv")
 
 
 # ============================================================
@@ -1221,10 +1558,10 @@ elif page == "About / Governance":
 - Demo datasets (benchmarks + athletes)
 - Role-based login (Player / Parent / Scout / Academy / Admin)
 - Athlete profile creation/update
-- Data entry (metrics)
+- Data entry (metrics) + charts
 - Upload center (Medical PDF + Photo + Video link/file)
-- Scout notes
-- Academy roster
+- Scout shortlist + notes + filters
+- Academy roster + analytics
 
 **Next stage (Product MVP):**
 - Verified registration (Nafath / Academy verification)
@@ -1235,7 +1572,7 @@ elif page == "About / Governance":
 - Cloud storage, audit logs, and fine-grained permissions
 """)
 
-    st.info("Pilot reminder: this is a demo running on Streamlit. For production, use a backend (API) + secure storage + full compliance controls.")
+    st.info("Pilot reminder: this is a demo running on Streamlit. For production, use backend API + secure storage + compliance controls.")
 
 
 # ============================================================
