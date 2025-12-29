@@ -2,25 +2,22 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 import sqlite3
-import json
 import hashlib
-import secrets
 import datetime
+import json
 import re
+import os
 
 # =========================
-# Basic page setup
+# CONFIG
 # =========================
-st.set_page_config(
-    page_title="ASABIG Talent Platform – Pilot Demo",
-    layout="wide",
-)
+st.set_page_config(page_title="ASABIG Talent Platform – Pilot Demo", layout="wide")
 
 BASE_DIR = Path(__file__).parent
+DB_PATH = BASE_DIR / "asabig.db"
+UPLOADS_DIR = BASE_DIR / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
 
-# =========================
-# Data files (CSV demo)
-# =========================
 DATA_FILES = {
     "generic_talent_data": "generic_talent_data.csv",
     "field_tests": "field_tests.csv",
@@ -30,276 +27,638 @@ DATA_FILES = {
     "athlete_tests": "athlete_tests.csv",
 }
 
-
-@st.cache_data
-def load_csv(name: str):
-    filename = DATA_FILES.get(name)
-    if not filename:
-        return None
-    path = BASE_DIR / filename
-    if not path.exists():
-        return None
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        # try latin-1 fallback
-        return pd.read_csv(path, encoding="latin-1")
-
-
-generic_df = load_csv("generic_talent_data")
-field_df = load_csv("field_tests")
-medical_df = load_csv("medical_data")
-sport_df = load_csv("sport_specific_kpis")
-athletes_df = load_csv("athletes")
-athlete_tests_df = load_csv("athlete_tests")
+ROLES = ["Player", "Parent", "Scout", "Academy", "Admin"]
 
 # =========================
-# Helper UI functions
+# HELPERS
 # =========================
-def section_title(text: str):
-    st.markdown(f"### {text}")
+def db():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+def now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
 
-def small_note(text: str):
-    st.caption(text)
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("_")
+    return name[:120] if name else "file"
 
-# =========================
-# SAFETY: make DataFrames Arrow-compatible for st.dataframe
-# (Fixes pyarrow / ArrowInvalid conversion errors)
-# =========================
 def safe_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make dataframe safe for Streamlit display (Arrow-compatible).
-    - Converts list/dict columns to string
-    - Tries to normalize mixed-type object columns safely
-    """
+    """Make dataframe safe for st.dataframe (avoid Arrow conversion errors)"""
     if df is None:
-        return df
-
+        return pd.DataFrame()
     if not isinstance(df, pd.DataFrame):
-        return pd.DataFrame(df)
-
-    if df.empty:
-        return df
-
+        df = pd.DataFrame(df)
     out = df.copy()
-
-    for col in out.columns:
-        try:
-            # Convert list/dict-like cells to string
-            if out[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                out[col] = out[col].astype(str)
-
-            # If object dtype, avoid mixed types causing Arrow conversion errors
-            if out[col].dtype == "object":
-                # Keep NaN as-is but convert non-scalar weird values to string
-                out[col] = out[col].apply(
-                    lambda x: x
-                    if (pd.isna(x) or isinstance(x, (str, int, float, bool)))
-                    else str(x)
-                )
-        except Exception:
-            # Last resort: stringify the whole column
-            out[col] = out[col].astype(str)
-
+    for c in out.columns:
+        if out[c].dtype == "object":
+            out[c] = out[c].apply(lambda x: "" if pd.isna(x) else (x if isinstance(x, (str,int,float,bool)) else json.dumps(x, ensure_ascii=False)))
     return out
 
+@st.cache_data
+def load_csv(key: str) -> pd.DataFrame:
+    fn = DATA_FILES.get(key)
+    if not fn:
+        return pd.DataFrame()
+    p = BASE_DIR / fn
+    if not p.exists():
+        return pd.DataFrame()
+    return pd.read_csv(p)
+
+def init_db():
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        full_name TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS athlete_profiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id INTEGER NOT NULL,
+        full_name TEXT NOT NULL,
+        gender TEXT NOT NULL, -- M / F
+        birth_year INTEGER,
+        sport TEXT,
+        city TEXT,
+        club TEXT,
+        dominant_side TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(owner_user_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS athlete_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        athlete_id INTEGER NOT NULL,
+        metric_name TEXT NOT NULL,
+        metric_value REAL,
+        unit TEXT,
+        measured_at TEXT NOT NULL,
+        note TEXT,
+        FOREIGN KEY(athlete_id) REFERENCES athlete_profiles(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        athlete_id INTEGER NOT NULL,
+        uploader_user_id INTEGER NOT NULL,
+        file_type TEXT NOT NULL, -- medical_pdf, photo, video, other
+        file_path TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        uploaded_at TEXT NOT NULL,
+        FOREIGN KEY(athlete_id) REFERENCES athlete_profiles(id),
+        FOREIGN KEY(uploader_user_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS parent_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        parent_user_id INTEGER NOT NULL,
+        athlete_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(parent_user_id, athlete_id),
+        FOREIGN KEY(parent_user_id) REFERENCES users(id),
+        FOREIGN KEY(athlete_id) REFERENCES athlete_profiles(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS scout_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scout_user_id INTEGER NOT NULL,
+        athlete_id INTEGER NOT NULL,
+        note TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(scout_user_id) REFERENCES users(id),
+        FOREIGN KEY(athlete_id) REFERENCES athlete_profiles(id)
+    )
+    """)
+
+    con.commit()
+    con.close()
+
+def get_user_by_email(email: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT id, full_name, email, password_hash, role FROM users WHERE email = ?", (email.lower().strip(),))
+    row = cur.fetchone()
+    con.close()
+    return row
+
+def create_user(full_name: str, email: str, password: str, role: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO users(full_name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
+        (full_name.strip(), email.lower().strip(), sha256(password), role, now_iso())
+    )
+    con.commit()
+    con.close()
+
+def login(email: str, password: str) -> bool:
+    row = get_user_by_email(email)
+    if not row:
+        return False
+    user_id, full_name, email, pw_hash, role = row
+    if sha256(password) != pw_hash:
+        return False
+    st.session_state["auth"] = {
+        "user_id": user_id,
+        "full_name": full_name,
+        "email": email,
+        "role": role
+    }
+    return True
+
+def logout():
+    st.session_state["auth"] = None
+
+def auth():
+    return st.session_state.get("auth")
+
+def require_login():
+    if not auth():
+        st.warning("Please login first.")
+        st.stop()
+
+def my_athletes_for_user(user_id: int, role: str) -> pd.DataFrame:
+    con = db()
+    cur = con.cursor()
+
+    if role == "Player":
+        cur.execute("""
+            SELECT * FROM athlete_profiles
+            WHERE owner_user_id = ?
+            ORDER BY created_at DESC
+        """, (user_id,))
+    elif role == "Parent":
+        cur.execute("""
+            SELECT ap.* FROM athlete_profiles ap
+            JOIN parent_links pl ON pl.athlete_id = ap.id
+            WHERE pl.parent_user_id = ?
+            ORDER BY ap.created_at DESC
+        """, (user_id,))
+    elif role == "Academy":
+        # Academy owner sees athletes they created (same as Player owner in this MVP)
+        cur.execute("""
+            SELECT * FROM athlete_profiles
+            WHERE owner_user_id = ?
+            ORDER BY created_at DESC
+        """, (user_id,))
+    elif role == "Scout":
+        # Scout can browse all (read-only) in this MVP
+        cur.execute("SELECT * FROM athlete_profiles ORDER BY created_at DESC")
+    else:  # Admin
+        cur.execute("SELECT * FROM athlete_profiles ORDER BY created_at DESC")
+
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description] if cur.description else []
+    con.close()
+    return pd.DataFrame(rows, columns=cols)
+
+def insert_athlete(owner_user_id: int, full_name: str, gender: str, birth_year, sport, city, club, dominant_side):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO athlete_profiles(owner_user_id, full_name, gender, birth_year, sport, city, club, dominant_side, created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+    """, (
+        owner_user_id, full_name.strip(), gender, birth_year, sport, city, club, dominant_side, now_iso()
+    ))
+    con.commit()
+    con.close()
+
+def add_metric(athlete_id: int, metric_name: str, metric_value, unit: str, measured_at: str, note: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO athlete_metrics(athlete_id, metric_name, metric_value, unit, measured_at, note)
+        VALUES(?,?,?,?,?,?)
+    """, (athlete_id, metric_name.strip(), metric_value, unit.strip(), measured_at, note.strip()))
+    con.commit()
+    con.close()
+
+def get_metrics(athlete_id: int) -> pd.DataFrame:
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT metric_name, metric_value, unit, measured_at, note
+        FROM athlete_metrics
+        WHERE athlete_id = ?
+        ORDER BY measured_at DESC
+    """, (athlete_id,))
+    rows = cur.fetchall()
+    con.close()
+    return pd.DataFrame(rows, columns=["metric_name","metric_value","unit","measured_at","note"])
+
+def save_upload(athlete_id: int, uploader_user_id: int, file_type: str, file_bytes: bytes, original_name: str):
+    athlete_dir = UPLOADS_DIR / f"athlete_{athlete_id}"
+    athlete_dir.mkdir(exist_ok=True)
+
+    safe_name = sanitize_filename(original_name)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = athlete_dir / f"{stamp}_{safe_name}"
+
+    with open(out_path, "wb") as f:
+        f.write(file_bytes)
+
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO uploads(athlete_id, uploader_user_id, file_type, file_path, original_name, uploaded_at)
+        VALUES(?,?,?,?,?,?)
+    """, (athlete_id, uploader_user_id, file_type, str(out_path), original_name, now_iso()))
+    con.commit()
+    con.close()
+
+def get_uploads(athlete_id: int) -> pd.DataFrame:
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT file_type, original_name, file_path, uploaded_at
+        FROM uploads
+        WHERE athlete_id = ?
+        ORDER BY uploaded_at DESC
+    """, (athlete_id,))
+    rows = cur.fetchall()
+    con.close()
+    return pd.DataFrame(rows, columns=["file_type","original_name","file_path","uploaded_at"])
+
+def link_parent_to_athlete(parent_user_id: int, athlete_id: int):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO parent_links(parent_user_id, athlete_id, created_at)
+        VALUES(?,?,?)
+    """, (parent_user_id, athlete_id, now_iso()))
+    con.commit()
+    con.close()
+
+def add_scout_note(scout_user_id: int, athlete_id: int, note: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO scout_notes(scout_user_id, athlete_id, note, created_at)
+        VALUES(?,?,?,?)
+    """, (scout_user_id, athlete_id, note.strip(), now_iso()))
+    con.commit()
+    con.close()
+
+def get_scout_notes(athlete_id: int) -> pd.DataFrame:
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT sn.note, sn.created_at, u.full_name AS scout_name
+        FROM scout_notes sn
+        JOIN users u ON u.id = sn.scout_user_id
+        WHERE sn.athlete_id = ?
+        ORDER BY sn.created_at DESC
+    """, (athlete_id,))
+    rows = cur.fetchall()
+    con.close()
+    return pd.DataFrame(rows, columns=["note","created_at","scout_name"])
+
+# Gender filter logic you requested:
+def gender_passes(row_gender: str, selected: str) -> bool:
+    # row_gender expected: "M", "F", or "M/F"
+    if selected == "All":
+        return True
+    if selected == "M":
+        return row_gender in ["M", "M/F"]
+    if selected == "F":
+        return row_gender in ["F", "M/F"]
+    return True
 
 # =========================
-# Sidebar / Navigation
+# INIT
 # =========================
-st.sidebar.title("ASABIG –\nNavigation")
+init_db()
+if "auth" not in st.session_state:
+    st.session_state["auth"] = None
 
-page = st.sidebar.radio(
-    "Choose page:",
-    ["Home", "Benchmarks & Data", "Model", "Athletes (Demo List)", "Athlete Profile", "Athlete Comparison", "About / Governance"],
-)
+# =========================
+# SIDEBAR
+# =========================
+st.sidebar.title("ASABIG – Navigation")
+u = auth()
+
+if u:
+    st.sidebar.success(f"Logged in: {u['full_name']} ({u['role']})")
+    if st.sidebar.button("Logout"):
+        logout()
+        st.rerun()
+else:
+    st.sidebar.info("Not logged in")
+
+PAGES = [
+    "Home",
+    "Login / Register",
+    "Dashboard",
+    "Player Data Entry",
+    "Uploads (Medical / Photos / Videos)",
+    "Benchmarks & Data",
+    "Model",
+    "Athletes (Demo List)",
+    "Athlete Profile",
+    "Athlete Comparison",
+    "About / Governance",
+]
+
+page = st.sidebar.radio("Choose page:", PAGES)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data files status:")
-
 for k, v in DATA_FILES.items():
     p = BASE_DIR / v
-    if p.exists():
-        st.sidebar.success(v)
-    else:
-        st.sidebar.error(f"{v} (missing)")
-
+    st.sidebar.write(f"✅ {v}" if p.exists() else f"❌ {v} (missing)")
 
 # =========================
 # PAGE: HOME
 # =========================
 if page == "Home":
     st.title("ASABIG – Talent Identification Platform (Pilot Demo)")
-    st.write(
-        "ASABIG is a data-driven talent identification platform for youth (7–23 years), "
-        "serving the Ministry of Sport, federations, clubs, and academies in Saudi Arabia."
-    )
+    st.write("ASABIG is a data-driven talent identification platform for youth (7–23 years), serving federations, clubs, schools, and academies.")
+    st.markdown("""
+**What this demo includes**
+- Registration / Login with roles (Player / Parent / Scout / Academy)
+- Role dashboards
+- Player data entry (metrics)
+- Uploads (medical PDF, photos, videos)
+- CSV demo pages (Benchmarks, demo athletes, comparison)
 
-    section_title("What does ASABIG cover?")
-    st.markdown(
-        """
-- 20+ sports (team, individual, combat, racket, eSports)  
-- M/F athletes from 7–23 years  
-- Integrated view of:
-  - Generic growth & maturation
-  - Field performance tests
-  - Medical & safety gates
-  - Sport-specific KPIs
-        """
-    )
-
-    section_title("Why it matters (for Saudi Arabia)?")
-    st.markdown(
-        """
-- Aligns with Saudi Vision 2030 – Sports & Quality of Life  
-- Reduces random selection and late discovery of talent  
-- Creates a national standard for tests, thresholds, and reporting  
-- Supports federations, clubs, schools, and private academies  
-        """
-    )
-
-    st.markdown("### الهدف (بالعربي)")
-    st.markdown(
-        """
-- مشروع وطني يرفع جودة اكتشاف الموهبة بشكل مبكر  
-- يعطي المدرب والأكاديمية رؤية رقمية 360 لملف اللاعب  
-- يخدم وزارة الرياضة والاتحادات عبر بيانات موحدة وتقارير رقمية  
-        """
-    )
-
-    st.info(
-        "This is a pilot demo running locally on your laptop. All athlete examples are synthetic – no real player data is used."
-    )
-
+> This is an MVP prototype. For production, we’d normally move auth/storage to a backend (Firebase/Postgres) + proper API.
+""")
 
 # =========================
-# PAGE: BENCHMARKS & DATA
+# PAGE: LOGIN / REGISTER
+# =========================
+elif page == "Login / Register":
+    st.title("Login / Register")
+
+    tabs = st.tabs(["Login", "Register"])
+
+    with tabs[0]:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_pw")
+        if st.button("Login"):
+            ok = login(email, password)
+            if ok:
+                st.success("Logged in successfully.")
+                st.rerun()
+            else:
+                st.error("Invalid email or password.")
+
+    with tabs[1]:
+        full_name = st.text_input("Full name", key="reg_name")
+        email2 = st.text_input("Email", key="reg_email")
+        pw1 = st.text_input("Password", type="password", key="reg_pw1")
+        pw2 = st.text_input("Confirm password", type="password", key="reg_pw2")
+        role = st.selectbox("Role", ROLES, index=0)
+        if st.button("Create account"):
+            if not full_name.strip():
+                st.error("Full name required.")
+            elif not email2.strip():
+                st.error("Email required.")
+            elif pw1 != pw2:
+                st.error("Passwords do not match.")
+            elif len(pw1) < 6:
+                st.error("Password must be at least 6 characters.")
+            else:
+                try:
+                    create_user(full_name, email2, pw1, role)
+                    st.success("Account created. Please login.")
+                except Exception as e:
+                    st.error(f"Could not create account (maybe email already used). Details: {e}")
+
+# =========================
+# PAGE: DASHBOARD
+# =========================
+elif page == "Dashboard":
+    require_login()
+    role = u["role"]
+    st.title(f"Dashboard – {role}")
+
+    athletes_df = my_athletes_for_user(u["user_id"], role)
+    st.subheader("My athletes")
+    st.dataframe(safe_df(athletes_df), use_container_width=True)
+
+    if role in ["Player", "Academy"]:
+        st.markdown("---")
+        st.subheader("Create athlete profile")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            full_name = st.text_input("Athlete full name")
+            gender = st.selectbox("Gender", ["M","F"])
+        with c2:
+            birth_year = st.number_input("Birth year", min_value=1980, max_value=2030, value=2008)
+            sport = st.text_input("Sport")
+        with c3:
+            city = st.text_input("City")
+            club = st.text_input("Club / Academy")
+            dominant_side = st.selectbox("Dominant side", ["Right","Left","Both"], index=0)
+
+        if st.button("Create athlete"):
+            insert_athlete(u["user_id"], full_name, gender, int(birth_year), sport, city, club, dominant_side)
+            st.success("Athlete created.")
+            st.rerun()
+
+    if role == "Parent":
+        st.markdown("---")
+        st.subheader("Link an athlete to your account")
+        st.caption("In this MVP, parent links by selecting athlete ID from the list.")
+        all_athletes = my_athletes_for_user(u["user_id"], "Admin")
+        if not all_athletes.empty:
+            athlete_id = st.selectbox("Select athlete ID to link", all_athletes["id"].tolist())
+            if st.button("Link athlete"):
+                link_parent_to_athlete(u["user_id"], int(athlete_id))
+                st.success("Linked.")
+                st.rerun()
+        else:
+            st.info("No athletes exist yet.")
+
+# =========================
+# PAGE: PLAYER DATA ENTRY
+# =========================
+elif page == "Player Data Entry":
+    require_login()
+    st.title("Player Data Entry (Metrics)")
+
+    athletes_df = my_athletes_for_user(u["user_id"], u["role"])
+    if athletes_df.empty:
+        st.info("No athlete profiles available. Create one from Dashboard.")
+        st.stop()
+
+    athlete_id = st.selectbox("Choose athlete", athletes_df["id"].tolist())
+    athlete_row = athletes_df[athletes_df["id"] == athlete_id].iloc[0]
+    st.write(f"**Athlete:** {athlete_row['full_name']} | **Gender:** {athlete_row['gender']} | **Sport:** {athlete_row.get('sport','')}")
+
+    st.markdown("---")
+    st.subheader("Add metric")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        metric_name = st.text_input("Metric name (e.g., VO2max, 30m Sprint)")
+    with m2:
+        metric_value = st.number_input("Value", value=0.0)
+    with m3:
+        unit = st.text_input("Unit (e.g., ml/kg/min, sec, cm)")
+    with m4:
+        measured_at = st.date_input("Measured date", value=datetime.date.today()).isoformat()
+
+    note = st.text_input("Note (optional)")
+    if st.button("Save metric"):
+        if not metric_name.strip():
+            st.error("Metric name required.")
+        else:
+            add_metric(int(athlete_id), metric_name, float(metric_value), unit, measured_at, note)
+            st.success("Saved.")
+
+    st.markdown("---")
+    st.subheader("Metrics history")
+    st.dataframe(safe_df(get_metrics(int(athlete_id))), use_container_width=True)
+
+# =========================
+# PAGE: UPLOADS
+# =========================
+elif page == "Uploads (Medical / Photos / Videos)":
+    require_login()
+    st.title("Uploads – Medical / Photos / Videos")
+
+    athletes_df = my_athletes_for_user(u["user_id"], u["role"])
+    if athletes_df.empty:
+        st.info("No athlete profiles available.")
+        st.stop()
+
+    athlete_id = st.selectbox("Choose athlete", athletes_df["id"].tolist())
+    athlete_row = athletes_df[athletes_df["id"] == athlete_id].iloc[0]
+    st.write(f"**Athlete:** {athlete_row['full_name']}")
+
+    st.markdown("---")
+    st.subheader("Upload files")
+
+    colA, colB = st.columns(2)
+    with colA:
+        medical_pdf = st.file_uploader("Medical test (PDF)", type=["pdf"], key="medical_pdf")
+        if medical_pdf and st.button("Upload medical PDF"):
+            save_upload(int(athlete_id), u["user_id"], "medical_pdf", medical_pdf.getvalue(), medical_pdf.name)
+            st.success("Uploaded medical PDF.")
+
+    with colB:
+        photo = st.file_uploader("Photo (jpg/png)", type=["jpg","jpeg","png"], key="photo")
+        video = st.file_uploader("Video (mp4/mov)", type=["mp4","mov"], key="video")
+
+        if photo and st.button("Upload photo"):
+            save_upload(int(athlete_id), u["user_id"], "photo", photo.getvalue(), photo.name)
+            st.success("Uploaded photo.")
+
+        if video and st.button("Upload video"):
+            save_upload(int(athlete_id), u["user_id"], "video", video.getvalue(), video.name)
+            st.success("Uploaded video.")
+
+    st.markdown("---")
+    st.subheader("Uploaded files")
+    up = get_uploads(int(athlete_id))
+    if up.empty:
+        st.info("No uploads yet.")
+    else:
+        st.dataframe(safe_df(up), use_container_width=True)
+        st.caption("Files are saved in the /uploads folder inside the app directory.")
+
+# =========================
+# PAGE: BENCHMARKS & DATA (CSV)
 # =========================
 elif page == "Benchmarks & Data":
     st.title("Benchmarks & Data – ASABIG Pilot Demo")
 
-    datasets = {
-        "Generic Talent Data": generic_df,
-        "Field Tests": field_df,
-        "Medical Data": medical_df,
-        "Sport Specific KPIs": sport_df,
-    }
+    dataset_key = st.selectbox("Choose dataset", list(DATA_FILES.keys()), index=0)
+    df = load_csv(dataset_key)
+    if df.empty:
+        st.warning("Dataset file missing or empty.")
+        st.stop()
 
-    dataset_name = st.selectbox("Choose dataset:", list(datasets.keys()))
-    df = datasets[dataset_name]
+    st.write(f"Rows: **{len(df)}** | Columns: **{len(df.columns)}**")
+    st.caption(f"File: {DATA_FILES[dataset_key]}")
 
-    if df is None:
-        st.error("Dataset not found (CSV missing).")
-    else:
-        st.write(f"Rows: {len(df)}")
-        st.write(f"Columns: {len(df.columns)}")
-        st.write("Label")
-        st.subheader(DATA_FILES[list(datasets.keys()).index(dataset_name)] if dataset_name in datasets else "dataset.csv")
+    # Age group filter (if exists)
+    age_filter = "All"
+    if "Age Group(s)" in df.columns:
+        age_filter = st.selectbox("Age group filter", ["All"] + sorted(df["Age Group(s)"].dropna().astype(str).unique().tolist()))
+        if age_filter != "All":
+            df = df[df["Age Group(s)"].astype(str) == age_filter]
 
-        # Filters
-        filter_cols = st.columns(3)
+    # Gender filter with your exact logic (M => M+M/F, F => F+M/F)
+    gender_col = None
+    for gc in ["Gender", "gender"]:
+        if gc in df.columns:
+            gender_col = gc
+            break
 
-        if "Age Group(s)" in df.columns:
-            age_value = filter_cols[0].selectbox(
-                "Age group filter", ["All"] + sorted(df["Age Group(s)"].dropna().unique().tolist())
-            )
-            if age_value != "All":
-                df = df[df["Age Group(s)"] == age_value]
+    if gender_col:
+        gender_sel = st.selectbox("Gender filter", ["All", "M", "F"], index=0)
+        df = df[df[gender_col].astype(str).apply(lambda g: gender_passes(g, gender_sel))]
 
-        if "Gender" in df.columns:
-            # Force consistent gender options + special rule:
-            # - If user selects "M" -> show rows where Gender is "M" OR "M/F"
-            # - If user selects "F" -> show rows where Gender is "F" OR "M/F"
-            # - If user selects "M/F" -> show only "M/F"
-            gender_options = ["All", "M", "F", "M/F"]
-            gender_value = filter_cols[1].selectbox("Gender filter", gender_options)
-            if gender_value != "All":
-                if gender_value == "M":
-                    df = df[df["Gender"].isin(["M", "M/F"])]
-                elif gender_value == "F":
-                    df = df[df["Gender"].isin(["F", "M/F"])]
-                else:  # "M/F"
-                    df = df[df["Gender"] == "M/F"]
-
-        if "Sport" in df.columns:
-            sport_value = filter_cols[2].selectbox(
-                "Sport filter", ["All"] + sorted(df["Sport"].dropna().unique().tolist())
-            )
-            if sport_value != "All":
-                df = df[df["Sport"] == sport_value]
-
-        st.subheader("Data preview")
-        st.dataframe(safe_df(df), use_container_width=True)
-
-        with st.expander("Summary (numeric columns)"):
-            st.write(df.describe(include="all"))
-
+    st.dataframe(safe_df(df), use_container_width=True)
 
 # =========================
-# PAGE: MODEL
+# PAGE: MODEL (placeholder)
 # =========================
 elif page == "Model":
-    st.title("ASABIG Model – From Raw Data to Decisions")
-
-    section_title("1. Data inputs")
-    st.markdown(
-        """
-- **Growth & maturation**: standing height, sitting height, body mass, BMI, PHV, etc.  
-- **Field performance**: sprint tests, agility, jumps, endurance, sport-specific skills.  
-- **Medical & safety**: injury history, ECG flags, asthma, concussion risk.  
-- **Context**: training age, position, competition level.
-        """
-    )
-
-    section_title("2. Standardization & Quality")
-    st.markdown(
-        """
-- Unified definitions + measurement methods  
-- Benchmarks by age group and sex  
-- Quality checks: outliers, missing values, implausible growth patterns
-        """
-    )
-
-    section_title("3. Scoring & Decision layer (pilot)")
-    st.markdown(
-        """
-- Convert tests into percentile vs age/sex benchmarks  
-- Produce a simple **Talent Readiness Score**  
-- Flag medical risks (red/amber/green)  
-- Output: short report for coach + parent + scout (role-based)
-        """
-    )
-
+    st.title("Model (Pilot Placeholder)")
+    st.write("Here you can connect your AI scoring / talent model later.")
+    st.markdown("""
+**Next steps ideas**
+- Talent Score per sport
+- Compare athlete vs benchmarks
+- Flag outliers / high potential
+- Scout recommendation engine
+""")
 
 # =========================
-# PAGE: ATHLETES (LIST)
+# PAGE: ATHLETES (DEMO LIST from CSV)
 # =========================
 elif page == "Athletes (Demo List)":
-    st.title("Athletes – Demo List")
+    st.title("Athletes (Demo List) – from athletes.csv")
+    athletes_df = load_csv("athletes")
+    if athletes_df.empty:
+        st.warning("athletes.csv missing.")
+        st.stop()
 
-    if athletes_df is None:
-        st.error("athletes.csv not found.")
-    else:
-        st.dataframe(safe_df(athletes_df), use_container_width=True)
+    # optional gender filter if column exists
+    gender_col = "gender" if "gender" in athletes_df.columns else ("Gender" if "Gender" in athletes_df.columns else None)
+    if gender_col:
+        gender_sel = st.selectbox("Gender filter", ["All", "M", "F"], index=0)
+        athletes_df = athletes_df[athletes_df[gender_col].astype(str).apply(lambda g: gender_passes(g, gender_sel))]
 
+    st.dataframe(safe_df(athletes_df), use_container_width=True)
 
 # =========================
-# PAGE: ATHLETE PROFILE
+# PAGE: ATHLETE PROFILE (DEMO)
 # =========================
 elif page == "Athlete Profile":
-    st.title("Athlete Profile (Demo)")
+    st.title("Athlete Profile (Demo) – from athletes.csv")
+    athletes_df = load_csv("athletes")
+    if athletes_df.empty:
+        st.warning("athletes.csv missing.")
+        st.stop()
 
-    if athletes_df is None:
-        st.error("athletes.csv not found.")
-    else:
-        display_col = "full_name" if "full_name" in athletes_df.columns else athletes_df.columns[0]
-        athlete_name = st.selectbox("Select athlete (demo):", athletes_df[display_col].astype(str).tolist())
-
-        row = athletes_df[athletes_df[display_col].astype(str) == str(athlete_name)].iloc[0]
-        st.json(row.to_dict())
-
+    display_col = "full_name" if "full_name" in athletes_df.columns else athletes_df.columns[0]
+    athlete_name = st.selectbox("Select athlete (demo)", athletes_df[display_col].astype(str).tolist())
+    row = athletes_df[athletes_df[display_col].astype(str) == str(athlete_name)].iloc[0]
+    st.json(row.to_dict())
 
 # =========================
 # PAGE: ATHLETE COMPARISON (UP TO 6)
@@ -307,88 +666,70 @@ elif page == "Athlete Profile":
 elif page == "Athlete Comparison":
     st.title("Athlete Comparison – Side by Side (Demo)")
 
-    if athletes_df is None:
+    athletes_df = load_csv("athletes")
+    tests_df = load_csv("athlete_tests")
+    if athletes_df.empty:
         st.error("athletes.csv not found.")
+        st.stop()
+
+    display_col = "full_name" if "full_name" in athletes_df.columns else athletes_df.columns[0]
+
+    MAX_COMPARE = 6
+    selected_names = st.multiselect(
+        f"Select up to {MAX_COMPARE} athletes to compare:",
+        athletes_df[display_col].astype(str).tolist(),
+        default=athletes_df[display_col].astype(str).tolist()[:min(4, len(athletes_df))]
+    )
+
+    if len(selected_names) > MAX_COMPARE:
+        st.warning(f"Showing first {MAX_COMPARE} athletes only.")
+        selected_names = selected_names[:MAX_COMPARE]
+
+    if not selected_names:
+        st.info("Select athletes to compare.")
+        st.stop()
+
+    comp_df = athletes_df[athletes_df[display_col].astype(str).isin([str(x) for x in selected_names])].copy()
+    st.dataframe(safe_df(comp_df), use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Simple test comparison (demo)")
+
+    if tests_df.empty:
+        st.info("athlete_tests.csv missing — chart will not show.")
+        st.stop()
+
+    metric_col = "metric" if "metric" in tests_df.columns else None
+    value_col = "value" if "value" in tests_df.columns else None
+    name_col = "full_name" if "full_name" in tests_df.columns else display_col
+
+    if not (metric_col and value_col and name_col):
+        st.info("athlete_tests.csv should include columns: full_name, metric, value (demo).")
+        st.stop()
+
+    metric = st.selectbox("Metric from athlete_tests.csv", sorted(tests_df[metric_col].astype(str).unique().tolist()))
+    plot_df = tests_df[
+        (tests_df[metric_col].astype(str) == str(metric)) &
+        (tests_df[name_col].astype(str).isin([str(x) for x in selected_names]))
+    ].copy()
+
+    if plot_df.empty:
+        st.info("No test values found for selected athletes and metric.")
     else:
-        display_col = "full_name" if "full_name" in athletes_df.columns else athletes_df.columns[0]
-
-        selected_names = st.multiselect(
-            "Select up to 6 athletes to compare:",
-            athletes_df[display_col].tolist(),
-        )
-
-        if not selected_names:
-            st.info("اختر لاعب أو أكثر من القائمة للمقارنة.")
-        else:
-            if len(selected_names) > 6:
-                st.warning("سيتم عرض أول ستة لاعبين فقط.")
-                selected_names = selected_names[:6]
-
-            df_selected = athletes_df[athletes_df[display_col].isin(selected_names)].copy()
-            st.subheader("Athletes (Basic Info)")
-            st.dataframe(safe_df(df_selected), use_container_width=True)
-
-            if athlete_tests_df is not None and "full_name" in athlete_tests_df.columns:
-                df_tests = athlete_tests_df[athlete_tests_df["full_name"].isin(selected_names)].copy()
-
-                st.subheader("Athlete Tests (if available)")
-                st.dataframe(safe_df(df_tests), use_container_width=True)
-
-                # Simple chart demo: pick a numeric metric if available
-                numeric_cols = df_tests.select_dtypes(include="number").columns.tolist()
-                if numeric_cols:
-                    metric_col = st.selectbox("Select numeric test metric to chart:", numeric_cols)
-                    st.line_chart(df_tests.set_index("full_name")[metric_col], use_container_width=True)
-                else:
-                    small_note("لا توجد أعمدة رقمية واضحة في athlete_tests.csv لعمل مخطط بسيط.")
-
+        # bar chart
+        chart = plot_df.groupby(name_col)[value_col].mean()
+        st.bar_chart(chart)
 
 # =========================
 # PAGE: ABOUT / GOVERNANCE
 # =========================
 elif page == "About / Governance":
-    st.title("About ASABIG – Governance & Data Protection")
-
-    section_title("Data ownership & roles")
-    st.markdown(
-        """
-- **Athletes & guardians**: own their personal data.  
-- **Institutions (clubs, academies, federations)**: act as custodians and operators.  
-- **Scouts & talent directors**: limited access by role and consent.  
-- **Ministry / federations**: aggregated analytics and national dashboards.
-        """
-    )
-
-    section_title("Privacy & compliance principles")
-    st.markdown(
-        """
-- PDPL-aligned data handling (Saudi Personal Data Protection Law).  
-- Consent-first for minors, guardian approval required.  
-- Data minimization: collect only what’s needed for sports performance & safety.  
-- Security: encryption, audit logs, role-based access.  
-        """
-    )
-
-    section_title("Future: registration, dashboards, uploads (planned)")
-    st.markdown(
-        """
-✅ نعم نقدر نضيف في Streamlit (Pilot) بشكل تدريجي:
-- تسجيل دخول (Player / Parent / Scout / Academy)  
-- لوحة لكل دور + صلاحيات  
-- إدخال بيانات اللاعب + سجل تدريبات  
-- رفع PDF للفحوصات الطبية + صور + فيديوهات  
-- تفضيلات اللاعب + الأهداف + الإشعارات  
-لكن هذا يحتاج توسعة مع قاعدة بيانات/تخزين ملفات (مثل SQLite + Storage)  
-        """
-    )
-
-    st.markdown("---")
-    st.subheader("Next Steps (Implementation Roadmap)")
-    st.markdown(
-        """
-1. Connect with real partners (academies, clubs).  
-2. Move from CSV demo to secure DB + file storage.  
-3. Add registration + role dashboards + uploads.  
-4. Add analytics: trends, percentile scoring, risk flags.  
-        """
-    )
+    st.title("About / Governance")
+    st.write("This is a pilot demo. Governance, privacy, and PDPL compliance will be handled in later stages.")
+    st.markdown("""
+**MVP Governance notes**
+- Data ownership: athlete/guardian
+- Role-based access: player/parent/scout/academy
+- Audit trail for uploads + edits
+- Consent for medical documents
+""")
